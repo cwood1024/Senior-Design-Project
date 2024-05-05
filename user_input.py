@@ -5,6 +5,14 @@ import sqlite3
 from pose_detect import detect_pose
 from frame_break import frame_break
 from prettytable import PrettyTable
+import xml.etree.ElementTree as ET
+import numpy as np
+import torch
+
+
+
+def load_yolov5_model():
+    return torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 
 def clear_frames(output_dir):
     for filename in os.listdir(output_dir):
@@ -32,7 +40,7 @@ def print_database_output(cursor):
 
     # Create a PrettyTable instance and add columns
     table = PrettyTable()
-    table.field_names = ["Hitter Name", "Hitting Side", "Stance Width", "Video Location"]
+    table.field_names = ["Hitter Name", "Hitting Side", "Stance Width", "Weight Distribution", "Spilling Over", "Video Location"]
 
     # Add data to the table
     for row in hitters_data:
@@ -40,7 +48,24 @@ def print_database_output(cursor):
         
     print(table)
 
+def calculate_angle(a, b, c):
+    a = np.array(a)  # First
+    b = np.array(b)  # Mid
+    c = np.array(c)  # End
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0:
+        angle = 360 - angle
+    return angle
+
 def hitter_analysis():
+
+    output_video_path = None
+    mlb_output_path = None
+
+    print("Output video path:", output_video_path)
+    print("MLB output path:", mlb_output_path)
+
     # Set the input video file path
     initial_input_video_path = input("Enter the input video file path (without quotation marks): ")
     
@@ -53,6 +78,8 @@ def hitter_analysis():
             hitter_name TEXT,
             hitting_side TEXT, 
             stance_width TEXT,
+            weight_distribution TEXT,
+            spilling_over TEXT,
             video_location TEXT     
             )'''
         )
@@ -83,7 +110,9 @@ def hitter_analysis():
     # Create a VideoWriter object
     output_video_base_name = "output_video"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Specify the video codec
+    model = load_yolov5_model()
     out = None
+   
 
     while True: 
         hitter_name = input("Enter the hitter's name: ")
@@ -101,6 +130,15 @@ def hitter_analysis():
             # Print the frame number being processed
             print("Processing frame:", f"frame_{frame_counter:04d}.jpg")
 
+            # Perform object detection using YOLOv5
+            results_yolo = model(frame)
+
+            # Render the detected objects on the frame
+            detected_frame = results_yolo.render()[0]
+
+            # Resize the frame for display
+            display_frame = cv2.resize(detected_frame, (1920, 1080))
+
             # Perform pose and object detection
             results_pose = detect_pose(frame)
 
@@ -108,6 +146,7 @@ def hitter_analysis():
                 # Your classification logic here
                 knee_distance = abs(results_pose.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_KNEE].x - results_pose.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_KNEE].x)
                 shoulder_distance = abs(results_pose.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER].x - results_pose.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER].x)
+                
 
                 if abs(results_pose.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE].x > results_pose.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST].x):
                     hitting_side = "Right Handed Hitter"
@@ -117,20 +156,41 @@ def hitter_analysis():
                 if hitting_side == "Right Handed Hitter":
                     if knee_distance > shoulder_distance:
                         stance_width = "Wide"
-                        print("Right-handed wide stance hitter.")
                     else:
                         stance_width = "Narrow"
-                        print("Right-handed narrow stance hitter.")
                 else:
                     if knee_distance > shoulder_distance:
                         stance_width = "Wide"
-                        print("Left-handed wide stance hitter.")
                     else:
                         stance_width = "Narrow"
-                        print("Left-handed narrow stance hitter.")
+                
+                
+            landmarks = results_pose.pose_landmarks.landmark
+            hip = (landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y)
+            knee = (landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].x ,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].y )
+            ankle = (landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x ,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y )
+            
+            if landmarks is not None:
+                # Analyze alignment - stack the back side
+                back_line = np.array([hip, knee, ankle])
+                alignment_error = np.linalg.norm(np.cross(back_line[1] - back_line[0], back_line[0] - back_line[2])) / np.linalg.norm(back_line[1] - back_line[0])
 
-            # Draw landmarks on the frame
-            mp_drawing.draw_landmarks(frame, results_pose.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                # Check for hip hinge
+                hip_hinge = calculate_angle(hip, knee, ankle)
+
+                # Check weight distribution
+                weight_distribution = 'balanced' if hip_hinge < 85 else 'over'
+
+                # Assess spilling over
+                spilling_over = 'yes' if hip_hinge > 90 else 'no'
+
+                # Draw landmarks on the frame
+                mp_drawing.draw_landmarks(frame, results_pose.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            else:
+                print("Pose landmarks not found.")
 
             # Write the frame to the output video
             if out is None:
@@ -139,35 +199,39 @@ def hitter_analysis():
                 output_video_path = os.path.join("output_vids", output_video_name)
                 out = cv2.VideoWriter(output_video_path, fourcc, 30.0, (width, height))
             out.write(frame)
+            out.write(detected_frame)
+
 
             # Insert data into the database
             cursor.execute('''
-                INSERT INTO hitters (hitter_name, hitting_side, stance_width, video_location)
-                VALUES (?, ?, ?, ?)
-            ''', (hitter_name, hitting_side, stance_width, output_video_path))
+                INSERT INTO hitters (hitter_name, hitting_side, stance_width, weight_distribution, spilling_over, video_location)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (hitter_name, hitting_side, stance_width, weight_distribution, spilling_over, output_video_path))
             conn.commit()
 
         print("File location of video:", output_video_path)
        
 
         # Compare user's data with the data in the second database
-        second_cursor.execute('SELECT * FROM hitters WHERE hitting_side = ? AND stance_width = ?', (hitting_side, stance_width))
+        second_cursor.execute('SELECT * FROM mlb_hitters WHERE hitting_side = ? AND stance_width = ?', (hitting_side, stance_width))
         mlb_output = second_cursor.fetchone()
+        print("MLB output: ", mlb_output)
 
         if mlb_output:
             # Perform the comparison logic here based on your requirements
             print("User's data:", (hitting_side, stance_width))
             print("Data from the second database:", mlb_output)
 
-        # Print database output
-        second_cursor.execute('SELECT * FROM hitters WHERE video_location = ?', (mlb_database_path,))
-        mlb_output = second_cursor.fetchone()
+            # Print database output
+            mlb_output_path = mlb_output[-1]
+            print(mlb_output_path)
         
-        mlb_output_path = mlb_output[-1]  # Get the file location from the last element
-        print("MLB Output Path:", mlb_output_path)
-        
-            #print("No MLB output found in the database.")
-            #mlb_output_path = "C:\SeniorDesign\mlb_hitters_processed"  # Set a default path
+        else:
+            print("Error: No data found in the second database.")
+            mlb_output_path = None  # Set a default value or handle this case as per your requirement
+
+        print("Output video path:", output_video_path)
+        print("MLB output path:", mlb_output_path)
 
         # Release the VideoWriter
         if out is not None:
@@ -178,8 +242,25 @@ def hitter_analysis():
 
         # Clear the individual frames
         clear_frames(output_directory)
+        if spilling_over == "yes":
+            print("You're loading too far back. Looking at the pose detection points, the points at the back shoulder, hip, ankle should be close to straight line but should not point away from the body. ")
+        
+        # Create XML tree
+        root = ET.Element("SwingData")
+
+        swing_sections = {}
+
+        # Add swing sections to XML
+        for frame_number, section in swing_sections.items():
+            frame_element = ET.SubElement(root, "Frame")
+            frame_element.set("Number", str(frame_number))
+            frame_element.set("Section", section)
+
+        # Create XML file
+        tree = ET.ElementTree(root)
+        tree.write("swing_data.xml")
 
         conn.close()
         second_conn.close()
 
-        return output_video_path, mlb_output
+        return output_video_path, mlb_output_path
